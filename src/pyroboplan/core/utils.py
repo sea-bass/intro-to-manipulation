@@ -4,6 +4,8 @@ import copy
 import numpy as np
 import pinocchio
 
+from ..models.utils import create_ellipsoid_mesh, add_ellipsoid_model
+
 
 def check_collisions_at_state(
     model, collision_model, q, data=None, collision_data=None
@@ -139,6 +141,83 @@ def get_random_state(model, padding=0.0):
     return np.random.uniform(
         model.lowerPositionLimit + padding, model.upperPositionLimit - padding
     )
+
+
+def get_random_state_inside_ellipsoid(model, target_frame, q_start, start, goal, ik, c_best = None, max_tries=1000):
+    """
+    Returns a random state that is within the generated model's ellipsoid.
+
+    Parameters
+    ----------
+        model : `pinocchio.Model`
+            The model from which to generate a random transform.
+        target_frame : str
+            The name of the frame for which to generate a random transform inside the ellipsoid.
+        q_start : array-like
+            The current starting joint configuration.
+        start : list
+            The starting cartesian position of the joints.
+        goal : list
+            The ending cartesian position of the joints.
+        ik : `pinocchio.IK`
+            The inverse kinematics solver to use for generating the random state.
+        c_best : float, optional
+            The best cost found so far.
+        max_tries : int, optional
+            The maximum number of tries to generate a random state inside the ellipsoid.
+    Returns
+    -------
+        array-like
+            A set of randomly generated joint variables.
+    """
+    c_min = configuration_distance(start, goal)
+    if c_best == np.inf:
+        c_best = c_min*2.5
+    normalized_direction_vector = (goal - start)/np.linalg.norm(goal - start)
+    # Compute rotation matrix
+    R = np.zeros((3, 3))
+    R[:, 0] = normalized_direction_vector
+    R[:, 1] = np.cross(normalized_direction_vector, [1, 0, 0])
+    if np.linalg.norm(R[:, 1]) == 0:
+        R[:, 1] = np.cross(normalized_direction_vector, [0, 1, 0])
+    R[:, 1] /= np.linalg.norm(R[:, 1])
+    R[:, 2] = np.cross(R[:, 0], R[:, 1])
+    # Compute diagonal matrix
+    L = np.diag([c_best / 2, c_best / 2, np.sqrt(c_best**2 - c_min**2) / 2])
+    # Ellipsoid visualization
+    ellipsoid_center = [(goal[0] + start[0]) / 2, (goal[1] + start[1]) / 2, (goal[2] + start[2]) / 2]
+    x_radius = L[0, 0]
+    y_radius = L[1, 1]
+    z_radius = L[2, 2]
+    ellipsoid_mesh = create_ellipsoid_mesh(x_radius, y_radius, z_radius)
+    add_ellipsoid_model(model, ellipsoid_mesh, position=ellipsoid_center, rotation_matrix=R)
+    q_sample = None
+    tries = 0
+    while q_sample is None:
+        if tries == max_tries:
+            return None
+        # Cast a sample from a unit ball
+        x = np.random.uniform(-1, 1)
+        y = np.random.uniform(-1, 1)
+        z = np.random.uniform(-1, 1)
+        unit_ball = np.array([x, y, z])
+        if np.square(x) + np.square(y) + np.square(z) < 1:
+            #Map ball sample to the ellipsoid
+            sampled_point = np.dot(R, np.dot(L, unit_ball)) + ellipsoid_center
+            # Use inverse kinematics to find a configuration that coincides with the sampled point
+            target_tform = pinocchio.SE3.Identity()
+            target_tform.translation = sampled_point
+            q_sample = ik.solve(
+                target_frame,
+                target_tform,
+                init_state=q_start,
+                nullspace_components=[],
+                verbose=False,
+            )
+        if q_sample is None:
+            tries += 1
+    print('Sampled random state in ellipsoid:', q_sample)
+    return q_sample
 
 
 def get_random_collision_free_state(model, collision_model, padding=0.0, max_tries=100):
@@ -306,6 +385,33 @@ def extract_cartesian_poses(model, target_frame, q_vec, data=None):
         pinocchio.framesForwardKinematics(model, data, q)
         tforms.append(copy.deepcopy(data.oMf[target_frame_id]))
     return tforms
+
+
+def get_translation_path_length(model, target_frame, q_vec):
+    """
+    Calculates the translation distance of a path in the given frame.
+
+    Parameters
+    ----------
+        model : `pinocchio.Model`
+            The model from which to perform forward kinematics.
+        target_frame : str
+            The name of the target frame.
+        q_vec : array-like
+            A list of joint configuration values describing the path.
+    
+    Returns
+    -------
+        float
+            The total translation distance traveled by the path in the given frame.
+    """
+    translation_path = []
+    for q in q_vec:
+        translation_path.append(extract_cartesian_pose(model, target_frame, q).translation)
+    translation_distance = 0
+    for i in range(1, len(q_vec)):
+        translation_distance += np.linalg.norm(translation_path[i] - translation_path[i-1])
+    return translation_distance
 
 
 def get_collision_geometry_ids(model, collision_model, body):
